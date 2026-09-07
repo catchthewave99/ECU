@@ -116,6 +116,16 @@ task, and measures the injector with a counter task. It has **not been executed*
 - there is no NI-DAQmx driver on a cloud VM, so it must be dry-run on the rig
 machine (Step 7 of `docs/01-plan-gaps-and-pitfalls.md`) before it is trusted.
 
+**Where it has to run.** The DAQmx Linux driver installs on a cloud VM but
+cannot be brought up: DKMS builds `nipalk.ko` against the installed headers, the
+VM runs a kernel with no matching headers, so `nipal.service` fails and every
+API call returns `-200090`. NI simulated devices need `nipal` too, so they are no
+help. The chassis is USB-attached to the bench in any case. That leaves two
+options: run the sequence on the bench machine, or run the **NI gRPC Device
+Server** there and point remote Python at it with
+`nidaqmx.Task(grpc_options=...)`. Pick one before Step 7 - it decides whether
+this file stays a local script or gains a connection argument.
+
 Two rules for whatever sequencer you end up using:
 
 * **Limits are read, never copied.** `tests/limits.env` is plain shell

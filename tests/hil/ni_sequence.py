@@ -10,10 +10,12 @@ Channel assignment and the reasoning behind it: docs/05-stage2-hil-ni-plan.md.
 
     python3 tests/hil/ni_sequence.py --list                 # enumerate devices
     python3 tests/hil/ni_sequence.py --case TC-HIL-03       # one case
-    python3 tests/hil/ni_sequence.py --all --out record.md  # full sequence
+    python3 tests/hil/ni_sequence.py --all                  # full sequence
 
-NOT YET EXECUTED. NI-DAQmx is not installable on the build VM, so this has only
-been checked for syntax and limit parsing. Dry-run it on the rig machine one case
+NOT YET EXECUTED. Run it on the bench machine, or against an NI gRPC Device
+Server there: the DAQmx driver installs on a cloud VM but its kernel modules do
+not load, so not even simulated devices work (docs/05 section 5). This file has
+only been checked for syntax and limit parsing. Dry-run it on the rig one case
 at a time (Step 7 in docs/01-plan-gaps-and-pitfalls.md) before trusting a number
 it prints.
 
