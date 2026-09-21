@@ -1,0 +1,7 @@
+# build artefacts and test results
+build/
+
+# compiled SIL harness
+tests/sil/sil_runner
+__pycache__/
+*.pyc
