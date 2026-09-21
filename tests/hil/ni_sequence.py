@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
-"""Stage 2 HIL sequence for the ECU bench (NI cDAQ-9173 + NI-9401 + NI-9263).
+"""HIL sequence for the Uno ECU bench (NI cDAQ-9173 + NI-9401 + NI-9263).
 
-The HIL twin of tests/sil/run_sil_suite.sh: same firmware, same acceptance
-limits from tests/limits.env, but the crank stimulus comes from the NI-9401, the
-sensor voltages from the NI-9263, and the injector pulse is measured by a
-chassis counter instead of by the emulator.
+The HIL twin of tests/sil/run_sil_suite.sh: same firmware, same cases, same
+acceptance limits from tests/limits.env. The switches are driven by the NI-9401
+instead of by the emulator, the temperature sensor is replaced by the NI-9263,
+and the lamps are read back on the NI-9401.
 
-Channel assignment and the reasoning behind it: docs/05-stage2-hil-ni-plan.md.
+    python3 tests/hil/ni_sequence.py --list           # enumerate NI devices
+    python3 tests/hil/ni_sequence.py --check-limits   # parse limits, no hardware
+    python3 tests/hil/ni_sequence.py --case TC-HIL-03 # one case
+    python3 tests/hil/ni_sequence.py --all            # full sequence
 
-    python3 tests/hil/ni_sequence.py --list                 # enumerate devices
-    python3 tests/hil/ni_sequence.py --case TC-HIL-03       # one case
-    python3 tests/hil/ni_sequence.py --all                  # full sequence
+Channel plan and reasoning: docs/04-hil-plan.md.
 
 NOT YET EXECUTED. Run it on the bench machine, or against an NI gRPC Device
 Server there: the DAQmx driver installs on a cloud VM but its kernel modules do
-not load, so not even simulated devices work (docs/05 section 5). This file has
-only been checked for syntax and limit parsing. Dry-run it on the rig one case
-at a time (Step 7 in docs/01-plan-gaps-and-pitfalls.md) before trusting a number
-it prints.
+not load, so not even simulated devices work. This file has been checked for
+syntax and limit parsing only. Bring it up one case at a time, starting with
+--list, then TC-HIL-01, before trusting a number it prints.
 
 Safety: the NI-9263 is a +/-10 V module and an Uno analog pin is rated to
 Vcc + 0.5 V. Every commanded voltage goes through clamp_volts(), and the
-hardware clamp of note N3 in docs/08-wiring-chart.md is fitted as well. Do not
+hardware clamp of note N3 in docs/07-wiring-chart.md is fitted as well. Do not
 remove either.
 """
 
@@ -39,27 +39,32 @@ LIMITS = ROOT / "tests" / "limits.env"
 
 # --- rig configuration -----------------------------------------------------
 # Verify with --list before a run; slots and device names come from NI MAX.
-DIO = "cDAQ1Mod1"       # NI-9401, lines 0-3 out, lines 4-7 in
-AO = "cDAQ1Mod2"        # NI-9263
-CTR = "cDAQ1/_ctr0"     # chassis counter, input routed from DIO line 4
+DIO = "cDAQ1Mod1"        # NI-9401: lines 0-3 out (switches), 4-7 in (lamps)
+AO = "cDAQ1Mod2"         # NI-9263
+CHASSIS = "cDAQ1"
 
-CRANK_TDC_LINE = f"{DIO}/port0/line0"
-CRANK_PRETDC_LINE = f"{DIO}/port0/line1"
-INJECTOR_PFI = f"/{DIO}/port0/line4"
-DI_LINES = f"{DIO}/port0/line5:7"       # overspeed, engine running, cranking
+# The NI-9401 sets direction per nibble, not per line, which is why the four
+# switches are one nibble and the four observed outputs are the other.
+SWITCH_LINES = ["hazard", "turnl", "turnr", "head"]      # lines 0-3, Uno D2/D4/D5/D7
+LAMP_LINES = ["lamp_left", "lamp_right", "fan", "overtemp"]  # lines 4-7, D8/D9/D11/D12
+DO_CHANS = f"{DIO}/port0/line0:3"
+DI_CHANS = f"{DIO}/port0/line4:7"
 
-AO_CHANNELS = {         # signal -> (channel, Uno pin)
-    "cht": (f"{AO}/ao0", "A1"),
-    "lambda": (f"{AO}/ao1", "A3"),
-    "mat": (f"{AO}/ao2", "A0"),
-    "throttle": (f"{AO}/ao3", "A5"),
-}
-
+TEMP_AO = f"{AO}/ao0"    # Uno A0, 10 mV per degree C
 AO_MIN_V = 0.0
-AO_MAX_V = 5.0          # never raise this: it is the Uno's absolute limit
-CRANK_DO_RATE_HZ = 100_000   # hardware-timed DO sample clock, 10 us resolution
-CRANK_PULSE_US = 250
-DEFAULTS_MV = {"mat": 3400, "cht": 2500, "lambda": 2295, "throttle": 512}
+AO_MAX_V = 5.0           # never raise this: it is the Uno's absolute limit
+
+# Hardware-timed switch/lamp measurement. 10 kHz gives 0.1 ms resolution on a
+# 100 ms requirement, which is the margin REQ-SAFE-100 deserves.
+CLOCK_HZ = 10_000
+DO_SAMPLE_CLOCK = f"/{CHASSIS}/do/SampleClock"
+DO_START_TRIGGER = f"/{CHASSIS}/do/StartTrigger"
+
+# The headlamp output (D10) and the heartbeat (D13) do not fit in the eight
+# NI-9401 lines, so they are observed in the telemetry line over USB serial.
+SERIAL_BAUD = 115200
+TELEMETRY_COLUMNS = ["t_ms", "coolantC", "fan", "overtemp",
+                     "head", "turnL", "turnR", "hazard", "loop_max_ms"]
 
 
 def load_limits(path: Path = LIMITS) -> dict[str, float]:
@@ -81,23 +86,9 @@ def clamp_volts(volts: float) -> float:
     return min(max(volts, AO_MIN_V), AO_MAX_V)
 
 
-def crank_waveform(rpm: int, advance_deg: int) -> list[list[bool]]:
-    """One revolution of the two crank lines, active low, for a buffered DO task.
-
-    Returns [tdc_samples, pretdc_samples] at CRANK_DO_RATE_HZ. Mirrors the
-    firmware's own generator in uno_baseline/Bench.ino so the SIL and HIL
-    stimuli have the same shape (DEV-004).
-    """
-    samples_per_rev = round(CRANK_DO_RATE_HZ * 60 / rpm)
-    pulse = max(1, round(CRANK_PULSE_US * CRANK_DO_RATE_HZ / 1_000_000))
-    pretdc_at = samples_per_rev - round(samples_per_rev * advance_deg / 360)
-
-    tdc = [True] * samples_per_rev
-    pretdc = [True] * samples_per_rev
-    for i in range(pulse):
-        tdc[i % samples_per_rev] = False
-        pretdc[(pretdc_at + i) % samples_per_rev] = False
-    return [tdc, pretdc]
+def temp_volts(deg_c: float) -> float:
+    """The sensor the firmware expects: 10 mV per degree C."""
+    return clamp_volts(deg_c / 100.0)
 
 
 @dataclass
@@ -105,13 +96,15 @@ class Result:
     case: str
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
 
+    def check_max(self, desc: str, value: float, high: float) -> None:
+        self.checks.append((desc, value <= high, f"{value:.3f} <= {high:g}"))
+
     def check_range(self, desc: str, value: float, low: float, high: float) -> None:
-        ok = low <= value <= high
-        self.checks.append((desc, ok, f"{value:.2f} in [{low:g}, {high:g}]"))
+        self.checks.append((desc, low <= value <= high,
+                            f"{value:.3f} in [{low:g}, {high:g}]"))
 
     def check_eq(self, desc: str, value, want) -> None:
-        ok = value == want
-        self.checks.append((desc, ok, f"got {value}, want {want}"))
+        self.checks.append((desc, value == want, f"got {value}, want {want}"))
 
     def report(self) -> bool:
         print(f"== {self.case} ==")
@@ -121,203 +114,281 @@ class Result:
 
 
 class Rig:
-    """Thin wrapper over the three DAQmx tasks the sequence needs.
+    """The three DAQmx tasks and the telemetry port, in one place.
 
-    Kept in one place so the bring-up order is explicit: AO to a safe level
-    first, then DI, then the counter, then the crank stimulus last.
+    Bring-up order matters: analog output to a safe level first, then the
+    switch outputs to "open", then the lamp inputs.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, serial_port: str | None = None) -> None:
         import nidaqmx  # imported here so --list can report a missing driver
-        from nidaqmx.constants import AcquisitionType, Edge, LineGrouping
+        from nidaqmx.constants import AcquisitionType, LineGrouping
 
         self._nidaqmx = nidaqmx
-        self._const = (AcquisitionType, Edge, LineGrouping)
+        self._acq = AcquisitionType
+        self._grouping = LineGrouping
+
         self.ao = nidaqmx.Task("ao")
-        self.di = nidaqmx.Task("di")
-        self.ctr = nidaqmx.Task("ctr")
+        self.ao.ao_channels.add_ao_voltage_chan(TEMP_AO, min_val=-10.0, max_val=10.0)
+        self.set_temp_c(25)
+
         self.do = nidaqmx.Task("do")
+        self.do.do_channels.add_do_chan(DO_CHANS,
+                                        line_grouping=LineGrouping.CHAN_PER_LINE)
+        self.switches()   # every switch open
 
-        for chan, _pin in AO_CHANNELS.values():
-            self.ao.ao_channels.add_ao_voltage_chan(chan, min_val=-10.0, max_val=10.0)
-        self.di.di_channels.add_di_chan(DI_LINES, line_grouping=LineGrouping.CHAN_PER_LINE)
-        # Two-edge separation would give phase directly; pulse width is the
-        # primary measurement, so start there (docs/05 section 3).
-        self.ctr.ci_channels.add_ci_pulse_width_chan(
-            CTR, min_val=100e-6, max_val=50e-3
-        ).ci_pulse_width_term = INJECTOR_PFI
-        self.ctr.timing.cfg_implicit_timing(
-            sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=1000
-        )
-        self.do.do_channels.add_do_chan(
-            f"{CRANK_TDC_LINE},{CRANK_PRETDC_LINE}",
-            line_grouping=LineGrouping.CHAN_PER_LINE,
-        )
-
-        self.set_sensors(DEFAULTS_MV)
+        self.di = nidaqmx.Task("di")
+        self.di.di_channels.add_di_chan(DI_CHANS,
+                                        line_grouping=LineGrouping.CHAN_PER_LINE)
         self.di.start()
-        self.ctr.start()
 
-    def set_sensors(self, millivolts: dict[str, int]) -> None:
-        order = list(AO_CHANNELS)
-        volts = [clamp_volts(millivolts.get(sig, DEFAULTS_MV.get(sig, 0)) / 1000.0)
-                 for sig in order]
-        self.ao.write(volts, auto_start=True)
+        self.serial = None
+        if serial_port:
+            import serial  # pyserial, only needed for the telemetry checks
+            self.serial = serial.Serial(serial_port, SERIAL_BAUD, timeout=1.0)
+            time.sleep(2.0)   # opening the port resets the Uno
 
-    def crank(self, rpm: int, advance_deg: int = 30) -> None:
-        AcquisitionType = self._const[0]
+    # -- stimulus ----------------------------------------------------------
+    def set_temp_c(self, deg_c: float) -> None:
+        self.ao.write(temp_volts(deg_c), auto_start=True)
+
+    def switches(self, hazard: bool = False, turnl: bool = False,
+                 turnr: bool = False, head: bool = False) -> None:
+        """Close or open the four switches. HIGH means closed."""
+        self.do.write([hazard, turnl, turnr, head], auto_start=True)
+
+    # -- observation -------------------------------------------------------
+    def lamps(self) -> dict[str, bool]:
+        return dict(zip(LAMP_LINES, self.di.read()))
+
+    def telemetry(self) -> dict[str, int] | None:
+        """The most recent telemetry record, or None if serial is not in use."""
+        if not self.serial:
+            return None
+        self.serial.reset_input_buffer()
+        for _ in range(20):
+            line = self.serial.readline().decode("ascii", "replace").strip()
+            fields = line.split("\t")
+            if len(fields) == len(TELEMETRY_COLUMNS) and fields[0].isdigit():
+                return {k: int(v) for k, v in zip(TELEMETRY_COLUMNS, fields)}
+        return None
+
+    def watch_lamp(self, signal: str, seconds: float) -> list[float]:
+        """Times, in ms from the start, of every rising edge of one lamp."""
+        index = LAMP_LINES.index(signal)
+        edges: list[float] = []
+        previous = self.lamps()[signal]
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < seconds:
+            level = self.di.read()[index]
+            if level and not previous:
+                edges.append((time.monotonic() - t0) * 1000.0)
+            previous = level
+            time.sleep(0.002)
+        return edges
+
+    def hazard_response_ms(self, presses: int, hold_ms: int = 250,
+                           gap_ms: int = 250) -> list[float]:
+        """Press the hazard switch repeatedly and time each lamp response.
+
+        Both tasks run off the same chassis sample clock and the DI task starts
+        on the DO start trigger, so a press and the lamp that answers it are in
+        the same sample index space: the latency is a sample count, not a
+        software timestamp. Anything software-timed would be measuring Windows,
+        not the ECU.
+
+        Pressing repeatedly is the point. A job that blocks for 160 ms only
+        delays the presses that land while it is busy (DEF-102).
+        """
+        hold = int(CLOCK_HZ * hold_ms / 1000)
+        gap = int(CLOCK_HZ * gap_ms / 1000)
+        per_press = hold + gap
+        total = presses * per_press
+
+        hazard = []
+        for _ in range(presses):
+            hazard.extend([True] * hold + [False] * gap)
+        idle = [False] * total
+        waveform = [hazard, idle, idle, idle]   # hazard, turnl, turnr, head
+
         self.do.stop()
-        if rpm == 0:
-            self.do.timing.samp_timing_type = self._nidaqmx.constants.SampleTimingType.ON_DEMAND
-            self.do.write([True, True], auto_start=True)
-            return
-        samples = crank_waveform(rpm, advance_deg)
         self.do.timing.cfg_samp_clk_timing(
-            rate=CRANK_DO_RATE_HZ,
-            sample_mode=AcquisitionType.CONTINUOUS,
-            samps_per_chan=len(samples[0]),
-        )
-        self.do.write(samples, auto_start=True)
+            rate=CLOCK_HZ, sample_mode=self._acq.FINITE, samps_per_chan=total)
 
-    def pulse_widths_us(self, seconds: float) -> list[float]:
-        self.ctr.in_stream.offset = 0
-        time.sleep(seconds)
-        try:
-            raw = self.ctr.read(number_of_samples_per_channel=-1)
-        except Exception as exc:  # noqa: BLE001 - report and let the case fail
-            print(f"  WARN  counter read failed: {exc}")
-            return []
-        return [w * 1e6 for w in raw]
+        self.di.stop()
+        self.di.timing.cfg_samp_clk_timing(
+            source=DO_SAMPLE_CLOCK, rate=CLOCK_HZ,
+            sample_mode=self._acq.FINITE, samps_per_chan=total)
+        self.di.triggers.start_trigger.cfg_dig_edge_start_trig(DO_START_TRIGGER)
 
-    def discretes(self) -> dict[str, bool]:
-        overspeed, running, cranking = self.di.read()
-        return {"overspeed": overspeed, "running": running, "cranking": cranking}
+        self.di.start()
+        self.do.write(waveform, auto_start=True)
+        self.do.wait_until_done(timeout=total / CLOCK_HZ + 5.0)
+        samples = self.di.read(number_of_samples_per_channel=total)
+        left = samples[LAMP_LINES.index("lamp_left")]
+        right = samples[LAMP_LINES.index("lamp_right")]
+
+        responses = []
+        for press in range(presses):
+            start = press * per_press
+            window = range(start, start + per_press)
+            lit = next((i for i in window if left[i] or right[i]), None)
+            # A press that never lit a lamp is a failure, not a missing sample.
+            responses.append((lit - start) * 1000.0 / CLOCK_HZ
+                             if lit is not None else 9999.0)
+
+        self._restore_on_demand()
+        return responses
+
+    def _restore_on_demand(self) -> None:
+        timing = self._nidaqmx.constants.SampleTimingType.ON_DEMAND
+        for task in (self.do, self.di):
+            task.stop()
+            task.timing.samp_timing_type = timing
+        self.di.start()
+        self.switches()
 
     def close(self) -> None:
-        self.crank(0)
-        self.set_sensors({k: 0 for k in AO_CHANNELS})
-        for task in (self.do, self.ctr, self.di, self.ao):
+        try:
+            self.switches()
+            self.set_temp_c(25)
+        except Exception:  # noqa: BLE001 - closing must not mask a failure
+            pass
+        for task in (self.do, self.di, self.ao):
             try:
                 task.stop()
                 task.close()
-            except Exception:  # noqa: BLE001 - closing must not mask a failure
+            except Exception:  # noqa: BLE001
                 pass
+        if self.serial:
+            self.serial.close()
 
 
-def median(values: list[float]) -> float:
-    return statistics.median(values) if values else float("nan")
+def settle(seconds: float = 0.5) -> None:
+    """Long enough for the firmware's 50 ms sensor timer and the RC on A0."""
+    time.sleep(seconds)
 
 
 # --- cases -----------------------------------------------------------------
+# One case per group of requirements, matching the SIL suite case for case.
 
 def tc_hil_01(rig: Rig, lim: dict[str, float]) -> Result:
+    """Thermal control: fan, warning lamp and hysteresis. REQ-THRM-010..014."""
     r = Result("TC-HIL-01")
-    rig.crank(0)
-    time.sleep(1.0)
-    widths = rig.pulse_widths_us(3.0)
-    r.check_eq("injector edges with no crank", len(widths), 0)
-    d = rig.discretes()
-    r.check_eq("engine running", d["running"], False)
-    r.check_eq("cranking", d["cranking"], False)
+    margin = lim["TEMP_STIM_MARGIN_C"]
+
+    rig.set_temp_c(80)
+    settle(1.0)
+    r.check_eq("cold 80C: fan off", rig.lamps()["fan"], False)
+    r.check_eq("cold 80C: overtemp lamp off", rig.lamps()["overtemp"], False)
+    record = rig.telemetry()
+    if record:
+        r.check_range("cold 80C: reported temp", record["coolantC"],
+                      80 - lim["TEMP_REPORT_TOL_C"], 80 + lim["TEMP_REPORT_TOL_C"])
+
+    rig.set_temp_c(lim["FAN_ON_C"] + margin)
+    settle(1.0)
+    r.check_eq("fan-on temperature: fan on", rig.lamps()["fan"], True)
+    r.check_eq("fan-on temperature: overtemp lamp off", rig.lamps()["overtemp"], False)
+
+    rig.set_temp_c(lim["OVERTEMP_C"] + margin)
+    settle(1.0)
+    r.check_eq("over-temperature: warning lamp on", rig.lamps()["overtemp"], True)
+
+    # Hysteresis: cool to just above the off point, the fan must stay on.
+    rig.set_temp_c(lim["FAN_OFF_C"] + 2)
+    settle(1.0)
+    r.check_eq("hysteresis: fan stays on above off point", rig.lamps()["fan"], True)
+    rig.set_temp_c(lim["FAN_OFF_C"] - 2)
+    settle(1.0)
+    r.check_eq("hysteresis: fan off below off point", rig.lamps()["fan"], False)
+
+    rig.set_temp_c(25)
     return r
 
 
 def tc_hil_02(rig: Rig, lim: dict[str, float]) -> Result:
+    """Body control: headlamps and the turn-signal flasher. REQ-BODY-020..023."""
     r = Result("TC-HIL-02")
-    rig.crank(0)
-    time.sleep(1.0)
-    rig.crank(1200)
-    t0 = time.monotonic()
-    cranking_seen = running_at = None
-    while time.monotonic() - t0 < lim["STATE_SETTLE_MS"] / 1000 + 1.0:
-        d = rig.discretes()
-        if cranking_seen is None and d["cranking"]:
-            cranking_seen = time.monotonic() - t0
-        if d["running"]:
-            running_at = time.monotonic() - t0
-            break
-        time.sleep(0.01)
-    r.check_eq("cranking asserted", cranking_seen is not None, True)
-    r.check_range("time to running (ms)", (running_at or 9.99) * 1000,
-                  0, lim["STATE_SETTLE_MS"])
+
+    rig.switches(head=False)
+    settle()
+    record = rig.telemetry()
+    if record:
+        r.check_eq("headlamp switch open: lamps off", record["head"], 0)
+    rig.switches(head=True)
+    settle()
+    record = rig.telemetry()
+    if record:
+        r.check_eq("headlamp switch closed: lamps on", record["head"], 1)
+    rig.switches()
+
+    rig.switches(turnl=True)
+    edges = rig.watch_lamp("lamp_left", 3.0)
+    right_edges = rig.watch_lamp("lamp_right", 0.5)
+    rig.switches()
+    r.check_eq("left stalk: left lamp flashes", len(edges) >= 2, True)
+    r.check_eq("left stalk: right lamp dark", len(right_edges), 0)
+    if len(edges) >= 2:
+        period = statistics.median([b - a for a, b in zip(edges, edges[1:])])
+        r.check_range("left stalk: flash full period (ms)", period,
+                      2 * lim["FLASH_HALF_MS_MIN"], 2 * lim["FLASH_HALF_MS_MAX"])
     return r
 
 
 def tc_hil_03(rig: Rig, lim: dict[str, float]) -> Result:
+    """REQ-SAFE-100: hazard response, the case this bench exists for."""
     r = Result("TC-HIL-03")
-    rig.crank(2000)
-    for mv, lo, hi in ((4000, lim["PULSE_81C_MIN"], lim["PULSE_81C_MAX"]),
-                       (3300, lim["PULSE_22C_MIN"], lim["PULSE_22C_MAX"])):
-        rig.set_sensors({**DEFAULTS_MV, "cht": mv})
-        time.sleep(2.0)                      # settle the filter and the RC
-        widths = rig.pulse_widths_us(3.0)
-        r.check_range(f"pulse at {mv} mV", median(widths), lo, hi)
-        if len(widths) >= 2:
-            print(f"  INFO  n={len(widths)} sd={statistics.stdev(widths):.2f} us")
+    presses = int(lim["HAZARD_PRESS_COUNT"])
+    responses = rig.hazard_response_ms(presses)
+    for i, ms in enumerate(responses):
+        print(f"  DATA  press {i + 1}: {ms:.3f} ms")
+    r.check_eq("every press answered", len(responses), presses)
+    r.check_max("slowest response (ms)", max(responses, default=9999.0),
+                lim["HAZARD_RESPONSE_MAX_MS"])
     return r
 
 
 def tc_hil_04(rig: Rig, lim: dict[str, float]) -> Result:
+    """The same deadline with the other two functions busy. REQ-SAFE-100."""
     r = Result("TC-HIL-04")
-    rig.set_sensors({**DEFAULTS_MV, "cht": 4000})
-    for rpm in (800, 2000, 4400):
-        rig.crank(rpm)
-        time.sleep(3.0)
-        widths = rig.pulse_widths_us(3.0)
-        expected_period_us = 60e6 / rpm
-        observed = len(widths) / 3.0 * 60 if widths else 0
-        tol = lim["ECU_SPEED_TOL_PCT"] / 100
-        r.check_range(f"injection rate at {rpm} rpm", observed,
-                      rpm * (1 - tol), rpm * (1 + tol))
-        print(f"  INFO  {rpm} rpm: expected period {expected_period_us:.0f} us")
+    rig.set_temp_c(lim["OVERTEMP_C"] + lim["TEMP_STIM_MARGIN_C"])
+    settle(1.0)
+    presses = int(lim["HAZARD_PRESS_COUNT"])
+    responses = rig.hazard_response_ms(presses)
+    r.check_max("slowest response, fan running (ms)",
+                max(responses, default=9999.0), lim["HAZARD_RESPONSE_MAX_MS"])
+    record = rig.telemetry()
+    if record:
+        r.check_max("slowest pass of loop() (ms)", record["loop_max_ms"],
+                    lim["LOOP_MAX_MS"])
+    rig.set_temp_c(25)
     return r
 
 
-def tc_hil_06(rig: Rig, lim: dict[str, float]) -> Result:
-    r = Result("TC-HIL-06")
-    rig.crank(2000)
-    time.sleep(2.0)
-    rig.crank(6000)
-    t0 = time.monotonic()
-    latency = None
-    while time.monotonic() - t0 < 5.0:
-        if rig.discretes()["overspeed"]:
-            latency = (time.monotonic() - t0) * 1000
-            break
-        time.sleep(0.005)
-    r.check_eq("overspeed asserted", latency is not None, True)
-    # O-REQ-1: no requirement for the latency yet, so record it, do not judge it.
-    print(f"  INFO  overspeed latency {latency if latency else float('nan'):.0f} ms"
-          " (recorded against O-REQ-1, DEF-018)")
-    return r
+def tc_hil_05(rig: Rig, lim: dict[str, float]) -> Result:
+    """Integration: one switch, one function. REQ-BODY-021, REQ-SAFE-103.
 
+    DEF-101 shows up here as headlamps that follow the hazard switch.
+    """
+    r = Result("TC-HIL-05")
+    rig.switches(hazard=True)
+    settle()
+    record = rig.telemetry()
+    if record:
+        r.check_eq("hazard switch does not touch the headlamps", record["head"], 0)
+        r.check_eq("hazard switch is seen by the hazard function", record["hazard"], 1)
+    lamps = rig.watch_lamp("lamp_left", 1.5)
+    right = rig.watch_lamp("lamp_right", 1.5)
+    r.check_eq("both hazard lamps flash", len(lamps) >= 1 and len(right) >= 1, True)
 
-def tc_hil_07(rig: Rig, lim: dict[str, float]) -> Result:
-    r = Result("TC-HIL-07")
-    rig.set_sensors({**DEFAULTS_MV, "cht": 4000})
-    rig.crank(2000)
-    time.sleep(2.0)
-    widths = rig.pulse_widths_us(6.0)
-    r.check_range("max pulse width", max(widths, default=float("nan")),
-                  0, lim["PULSE_ABS_MAX_US"])
-    r.check_range("pulses observed", len(widths),
-                  lim["PULSE_COUNT_MIN"], lim["PULSE_COUNT_MAX"])
-    return r
-
-
-def tc_hil_10(rig: Rig, lim: dict[str, float]) -> Result:
-    """CHT sweep: reproduces the whole baseInt table. No SIL twin."""
-    r = Result("TC-HIL-10")
-    rig.crank(2000)
-    table = []
-    for mv in range(500, 4600, 100):
-        rig.set_sensors({**DEFAULTS_MV, "cht": mv})
-        time.sleep(1.0)
-        table.append((mv, median(rig.pulse_widths_us(1.0))))
-    for mv, width in table:
-        print(f"  DATA  cht_mv={mv} pulse_us={width:.2f}")
-    monotonic = all(b[1] <= a[1] + 1 for a, b in zip(table, table[1:]))
-    r.check_eq("pulse width decreases with temperature", monotonic, True)
+    # Stalk first, then hazard: hazard must take both lamps.
+    rig.switches(turnl=True)
+    settle()
+    rig.switches(turnl=True, hazard=True)
+    right = rig.watch_lamp("lamp_right", 1.5)
+    r.check_eq("hazard beats the turn stalk", len(right) >= 1, True)
+    rig.switches()
     return r
 
 
@@ -326,12 +397,8 @@ CASES = {
     "TC-HIL-02": tc_hil_02,
     "TC-HIL-03": tc_hil_03,
     "TC-HIL-04": tc_hil_04,
-    "TC-HIL-06": tc_hil_06,
-    "TC-HIL-07": tc_hil_07,
-    "TC-HIL-10": tc_hil_10,
+    "TC-HIL-05": tc_hil_05,
 }
-# Still to implement: TC-HIL-05 (needs two-edge separation against the crank
-# DO edge), TC-HIL-08, TC-HIL-11 to TC-HIL-16. See docs/05 section 4.
 
 
 def list_devices() -> int:
@@ -352,7 +419,8 @@ def main(argv: list[str]) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--list", action="store_true", help="enumerate NI devices and exit")
     ap.add_argument("--case", action="append", help="case id, repeatable")
-    ap.add_argument("--all", action="store_true", help="run every implemented case")
+    ap.add_argument("--all", action="store_true", help="run every case")
+    ap.add_argument("--port", help="Uno serial port for telemetry, e.g. /dev/ttyACM0")
     ap.add_argument("--check-limits", action="store_true",
                     help="parse tests/limits.env and exit (no hardware needed)")
     args = ap.parse_args(argv)
@@ -373,7 +441,7 @@ def main(argv: list[str]) -> int:
     if unknown:
         ap.error(f"unknown case(s): {', '.join(unknown)}")
 
-    rig = Rig()
+    rig = Rig(args.port)
     ok = True
     try:
         for case in selected:
